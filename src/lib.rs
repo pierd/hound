@@ -88,7 +88,7 @@ pub trait Sample: Sized {
     fn write_padded<W: io::Write>(self, writer: &mut W, bits: u16, byte_width: u16) -> Result<()>;
 
     /// Reads the audio sample from the WAVE data chunk.
-    fn read<R: io::Read>(reader: &mut R, SampleFormat, bytes: u16, bits: u16) -> Result<Self>;
+    fn read<R: io::Read>(reader: &mut R, _: SampleFormat, bytes: u16, bits: u16) -> Result<Self>;
 
     /// Cast the sample to a 16-bit sample.
     ///
@@ -222,7 +222,7 @@ impl Sample for i16 {
     fn write_padded<W: io::Write>(self, writer: &mut W, bits: u16, byte_width: u16) -> Result<()> {
         match (bits, byte_width) {
             (8, 1) => Ok(try!(
-                writer.write_u8(u8_from_signed(try!(narrow_to_i8(self as i32))))
+                writer.write_u8(u8_from_signed(narrow_to_i8(self as i32)?))
             )),
             (16, 2) => Ok(try!(writer.write_le_i16(self))),
             (24, 3) => Ok(try!(writer.write_le_i24(self as i32))),
@@ -259,11 +259,11 @@ impl Sample for i32 {
     fn write_padded<W: io::Write>(self, writer: &mut W, bits: u16, byte_width: u16) -> Result<()> {
         match (bits, byte_width) {
             (8, 1) => Ok(try!(
-                writer.write_u8(u8_from_signed(try!(narrow_to_i8(self))))
+                writer.write_u8(u8_from_signed(narrow_to_i8(self)?))
             )),
-            (16, 2) => Ok(try!(writer.write_le_i16(try!(narrow_to_i16(self))))),
-            (24, 3) => Ok(try!(writer.write_le_i24(try!(narrow_to_i24(self))))),
-            (24, 4) => Ok(try!(writer.write_le_i24_4(try!(narrow_to_i24(self))))),
+            (16, 2) => Ok(try!(writer.write_le_i16(narrow_to_i16(self)?))),
+            (24, 3) => Ok(try!(writer.write_le_i24(narrow_to_i24(self)?))),
+            (24, 4) => Ok(try!(writer.write_le_i24_4(narrow_to_i24(self)?))),
             (32, 4) => Ok(try!(writer.write_le_i32(self))),
             _ => Err(Error::Unsupported),
         }

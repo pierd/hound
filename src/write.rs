@@ -237,7 +237,7 @@ impl ChunkWritingState {
 /// For simple out-of-the-box wav usage, prefer the `WavWriter` facade.
 pub struct ChunksWriter<W: io::Write + io::Seek> {
     /// underlying writer
-    writer: W,
+    writer: Option<W>,
     /// wave spec, if known at that point
     pub spec_ex: Option<WavSpecEx>,
     /// state of the data chunk, if currently writing it
@@ -247,6 +247,10 @@ pub struct ChunksWriter<W: io::Write + io::Seek> {
 }
 
 impl<W: io::Write + io::Seek> ChunksWriter<W> {
+    fn writer(&mut self) -> &mut W {
+        self.writer.as_mut().expect("Writer already taken")
+    }
+
     /// Creates a ChunksWriter.
     ///
     /// Write the RIFF header (including a len placeholder). The writer
@@ -254,7 +258,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     pub fn new(mut writer: W) -> Result<ChunksWriter<W>> {
         try!(writer.write_all(b"RIFF\0\0\0\0WAVE"));
         Ok(ChunksWriter {
-            writer: writer,
+            writer: Some(writer),
             spec_ex: None,
             dirty: false,
             data_state: None,
@@ -266,10 +270,11 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     ///
     /// The writer is then repositioned at end of file.
     fn update_riff_header(&mut self) -> io::Result<()> {
-        let full_len = try!(self.writer.seek(io::SeekFrom::Current(0)));
-        try!(self.writer.seek(io::SeekFrom::Start(4)));
-        try!(self.writer.write_le_u32(full_len as u32 - 8));
-        try!(self.writer.seek(io::SeekFrom::Current(full_len as i64 - 8)));
+        let writer = self.writer();
+        let full_len = try!(writer.seek(io::SeekFrom::Current(0)));
+        try!(writer.seek(io::SeekFrom::Start(4)));
+        try!(writer.write_le_u32(full_len as u32 - 8));
+        try!(writer.seek(io::SeekFrom::Current(full_len as i64 - 8)));
         Ok(())
     }
 
@@ -286,9 +291,10 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     fn update_data_chunk_header(&mut self) -> Result<()> {
         let data_state = self.data_state.expect("Should only be called in data chunk");
         let spec_ex = self.spec_ex.expect("Data chunk implies known format");
-        try!(self.writer.seek(io::SeekFrom::End(-(data_state.len as i64 + 4))));
-        try!(self.writer.write_le_u32(data_state.len));
-        try!(self.writer.seek(io::SeekFrom::End(0)));
+        let writer = self.writer();
+        try!(writer.seek(io::SeekFrom::End(-(data_state.len as i64 + 4))));
+        try!(writer.write_le_u32(data_state.len));
+        try!(writer.seek(io::SeekFrom::End(0)));
 
         // Signal error if the last sample was not finished, but do so after
         // everything has been written, so that no data is lost, even though
@@ -309,10 +315,11 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     pub fn start_chunk(&mut self, fourcc:[u8;4]) -> Result<EmbeddedWriter<W>> {
         self.data_state = None;
         self.dirty = true;
-        try!(self.writer.write_all(&fourcc));
-        try!(self.writer.write_le_u32(0));
+        let writer = self.writer();
+        try!(writer.write_all(&fourcc));
+        try!(writer.write_le_u32(0));
         Ok(EmbeddedWriter {
-            writer: &mut self.writer,
+            writer,
             state: ChunkWritingState { len: 0 },
             finalized: false,
         })
@@ -323,8 +330,9 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
         if self.spec_ex.is_none() {
             panic!("Format must be written before data");
         }
-        try!(self.writer.write_all(b"data"));
-        try!(self.writer.write_le_u32(0));
+        let writer = self.writer();
+        try!(writer.write_all(b"data"));
+        try!(writer.write_le_u32(0));
         self.data_state = Some(ChunkWritingState { len: 0 });
         self.dirty = true;
         Ok(())
@@ -348,7 +356,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     /// header and the data chunk header if required.
     pub fn flush(&mut self) -> Result<()> {
         try!(self.update_headers());
-        try!(self.writer.flush());
+        try!(self.writer().flush());
         Ok(())
     }
 
@@ -357,13 +365,13 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     /// This method must be called after all samples have been written. If it
     /// is not called, the destructor will finalize the file, but any errors
     /// that occur in the process cannot be observed in that manner.
-    pub fn finalize(mut self) -> Result<()> {
+    pub fn finalize(mut self) -> Result<W> {
         // We need to perform a flush here to truly capture all errors before
         // the writer is dropped: for a buffered writer, the write to the buffer
         // may succeed, but the write to the underlying writer may fail. So
         // flush explicitly.
         try!(self.flush());
-        Ok(())
+        Ok(self.writer.take().expect("Writer already taken"))
     }
 
     /// Encode and write the provided spec as a format header in the stream.
@@ -396,7 +404,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
         }
 
         let mut header = [0u8; 48];
-        try!(self.writer.write(b"fmt "));
+        try!(self.writer().write(b"fmt "));
         let written = {
             let mut buffer = io::Cursor::new(&mut header[..]);
             match fmt_kind {
@@ -409,7 +417,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
             }
             buffer.position()
         };
-        try!(self.writer.write_all(&header[..written as usize]));
+        try!(self.writer().write_all(&header[..written as usize]));
 
         self.spec_ex = Some(spec_ex);
 
@@ -534,7 +542,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
     pub fn write_sample<S: Sample>(&mut self, sample: S) -> Result<()> {
         let spec_ex = self.spec_ex.expect("Format should have written before this call");
         try!(sample.write_padded(
-            &mut self.writer,
+            self.writer(),
             spec_ex.spec.bits_per_sample,
             spec_ex.bytes_per_sample
         ));
@@ -584,7 +592,7 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
         }
 
         SampleWriter16 {
-            writer: &mut self.writer,
+            writer: self.writer.as_mut().unwrap(),
             buffer: &mut self.sample_writer_buffer[..num_bytes],
             data_bytes_written:
                 &mut self.data_state.as_mut().expect("Can only be called positioned in data chunk").len,
@@ -595,7 +603,9 @@ impl<W: io::Write + io::Seek> ChunksWriter<W> {
 
 impl<W: io::Write + io::Seek> Drop for ChunksWriter<W> {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if self.writer.is_some() {
+            let _ = self.flush();
+        }
     }
 }
 
@@ -708,7 +718,7 @@ impl<W> WavWriter<W>
     /// This method must be called after all samples have been written. If it
     /// is not called, the destructor will finalize the file, but any errors
     /// that occur in the process cannot be observed in that manner.
-    pub fn finalize(self) -> Result<()> {
+    pub fn finalize(self) -> Result<W> {
         // We need to perform a flush here to truly capture all errors before
         // the writer is dropped: for a buffered writer, the write to the buffer
         // may succeed, but the write to the underlying writer may fail. So
@@ -835,7 +845,7 @@ impl WavWriter<io::BufWriter<fs::File>> {
         let writer = WavWriter {
             writer: ChunksWriter {
                 spec_ex: Some(spec_ex),
-                writer: buf_writer,
+                writer: Some(buf_writer),
                 sample_writer_buffer: Vec::new(),
                 dirty: true,
                 data_state: Some(ChunkWritingState { len: data_len }),
@@ -865,7 +875,7 @@ impl<W> WavWriter<W> where W: io::Read + io::Write + io::Seek {
         let writer = WavWriter {
             writer: ChunksWriter {
                 spec_ex: Some(spec_ex),
-                writer: writer,
+                writer: Some(writer),
                 sample_writer_buffer: Vec::new(),
                 dirty: true,
                 data_state: Some(ChunkWritingState { len: data_len }),
